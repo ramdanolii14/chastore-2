@@ -5,6 +5,7 @@ import { revalidatePath } from "next/cache";
 import { auth, isAdminEmail } from "@/lib/auth";
 import { supabaseAdmin } from "@/lib/supabase";
 import { slugify } from "@/lib/utils";
+import { sendInvoiceEmail } from "@/lib/email";
 
 async function requireAdmin() {
   const session = await auth.api.getSession({ headers: headers() });
@@ -140,4 +141,89 @@ export async function deleteStockItem(formData: FormData) {
     .eq("status", "available"); // jangan pernah hapus stok yang sudah terjual
   if (error) throw new Error(error.message);
   revalidatePath("/admin/stock");
+}
+
+// Tombol "Tandai Lunas Manual" di /admin/orders — buat kasus pembeli
+// sudah bayar (dikonfirmasi manual lewat dashboard DOKU) tapi webhook
+// gagal/belum sempat diproses. Pakai fungsi Postgres yang SAMA dengan
+// yang dipanggil webhook (fulfill_order_item), jadi tetap aman dari
+// tabrakan stok dengan pembeli lain yang lagi checkout produk yang sama.
+export async function markOrderPaidManually(formData: FormData) {
+  await requireAdmin();
+
+  const orderId = String(formData.get("order_id") || "");
+  if (!orderId) throw new Error("Order tidak ditemukan.");
+
+  const { data: order, error: orderErr } = await supabaseAdmin
+    .from("orders")
+    .select("*, order_items(*)")
+    .eq("id", orderId)
+    .single();
+
+  if (orderErr || !order) throw new Error("Order tidak ditemukan.");
+  if (order.status === "paid") {
+    // sudah lunas, gak perlu ngapa-ngapain lagi
+    revalidatePath("/admin/orders");
+    return;
+  }
+
+  const deliveredItems: {
+    productName: string;
+    credentialEmail?: string | null;
+    credentialPassword?: string | null;
+    credentialExtra?: string | null;
+    durationLabel?: string | null;
+  }[] = [];
+
+  for (const item of order.order_items as any[]) {
+    const { data: fulfilled, error: fulfillErr } = await supabaseAdmin.rpc("fulfill_order_item", {
+      p_order_id: order.id,
+      p_product_id: item.product_id,
+      p_quantity: item.quantity,
+    });
+
+    if (fulfillErr) {
+      // Stok beneran habis (bukan cuma reserved-tapi-belum-expired) —
+      // jangan ditandai lunas, kasih tau adminnya kenapa gagal.
+      throw new Error(
+        `Gagal menjatah stok "${item.product_name}": ${fulfillErr.message}. Tambah stok dulu baru coba lagi.`
+      );
+    }
+
+    for (const stock of fulfilled || []) {
+      deliveredItems.push({
+        productName: item.product_name,
+        credentialEmail: stock.credential_email,
+        credentialPassword: stock.credential_password,
+        credentialExtra: stock.credential_extra,
+        durationLabel: stock.duration_label,
+      });
+    }
+  }
+
+  const paidAt = new Date();
+  const { error: updateErr } = await supabaseAdmin
+    .from("orders")
+    .update({ status: "paid", paid_at: paidAt.toISOString() })
+    .eq("id", order.id);
+
+  if (updateErr) throw new Error(updateErr.message);
+
+  try {
+    await sendInvoiceEmail({
+      to: order.customer_email,
+      customerName: order.customer_name,
+      invoiceNumber: order.invoice_number,
+      totalAmount: order.total_amount,
+      items: deliveredItems,
+      paidAt,
+    });
+  } catch (emailErr) {
+    // Stok udah kejatah & order udah paid, cuma emailnya yang gagal
+    // terkirim -- jangan bikin admin mikir transaksinya gagal total.
+    console.error("Gagal kirim email invoice manual:", emailErr);
+  }
+
+  revalidatePath("/admin/orders");
+  revalidatePath(`/orders/${order.invoice_number}`);
 }

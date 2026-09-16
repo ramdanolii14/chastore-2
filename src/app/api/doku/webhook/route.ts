@@ -70,7 +70,11 @@ export async function POST(req: NextRequest) {
 
   try {
     for (const item of order.order_items as any[]) {
-      const { data: assigned, error: assignErr } = await supabaseAdmin.rpc("assign_stock", {
+      // fulfill_order_item finalisasi stok yang udah direservasi pas
+      // checkout (status reserved -> sold). Kalau karena suatu hal
+      // reservasinya kurang/sudah expired, fungsi ini otomatis coba
+      // ambil dari stok available yang tersisa.
+      const { data: assigned, error: assignErr } = await supabaseAdmin.rpc("fulfill_order_item", {
         p_order_id: order.id,
         p_product_id: item.product_id,
         p_quantity: item.quantity,

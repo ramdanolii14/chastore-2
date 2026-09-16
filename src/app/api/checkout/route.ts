@@ -16,6 +16,8 @@ const bodySchema = z.object({
     .min(1),
 });
 
+const RESERVE_MINUTES = 60; // samain sama payment_due_date DOKU
+
 export async function POST(req: NextRequest) {
   const session = await auth.api.getSession({ headers: req.headers });
   if (!session?.user) {
@@ -40,25 +42,10 @@ export async function POST(req: NextRequest) {
   }
 
   const productMap = new Map(products.map((p) => [p.id, p]));
-
-  // Cek stok tersedia untuk tiap item (validasi awal; penjatahan final &
-  // atomik tetap terjadi di webhook lewat fungsi assign_stock).
   for (const item of requestedItems) {
     const product = productMap.get(item.productId);
     if (!product || !product.is_active) {
       return NextResponse.json({ error: "Salah satu produk tidak aktif." }, { status: 400 });
-    }
-    const { count } = await supabaseAdmin
-      .from("stock_items")
-      .select("id", { count: "exact", head: true })
-      .eq("product_id", item.productId)
-      .eq("status", "available");
-
-    if ((count || 0) < item.quantity) {
-      return NextResponse.json(
-        { error: `Stok "${product.name}" tidak cukup (sisa ${count || 0}).` },
-        { status: 400 }
-      );
     }
   }
 
@@ -101,6 +88,30 @@ export async function POST(req: NextRequest) {
 
   await supabaseAdmin.from("order_items").insert(orderItemsPayload);
 
+  // ── RESERVASI STOK ────────────────────────────────────────────────
+  // Ini bagian yang mencegah 2 pembeli rebutan stok yang sama: begitu
+  // direservasi di sini, item itu langsung gak kehitung "tersedia" lagi
+  // buat orang lain, SEBELUM DOKU payment link dibuat. Kalau reservasi
+  // gagal (stok kurang), order langsung dibatalkan & stok yang keburu
+  // kereservasi di item lain (kalau checkout multi-produk) dilepas lagi.
+  for (const item of orderItemsPayload) {
+    const { error: reserveErr } = await supabaseAdmin.rpc("reserve_stock", {
+      p_order_id: order.id,
+      p_product_id: item.product_id,
+      p_quantity: item.quantity,
+      p_reserve_minutes: RESERVE_MINUTES,
+    });
+
+    if (reserveErr) {
+      await supabaseAdmin.rpc("release_order_stock", { p_order_id: order.id });
+      await supabaseAdmin.from("orders").update({ status: "cancelled" }).eq("id", order.id);
+      return NextResponse.json(
+        { error: `Stok "${item.product_name}" baru saja habis diambil pembeli lain. Coba produk lain atau ulangi lagi.` },
+        { status: 409 }
+      );
+    }
+  }
+
   try {
     const payment = await createDokuPayment({
       invoiceNumber,
@@ -108,6 +119,7 @@ export async function POST(req: NextRequest) {
       customerName: session.user.name || undefined,
       customerEmail: session.user.email,
       callbackUrl: `${appUrl}/orders/${invoiceNumber}`,
+      paymentDueMinutes: RESERVE_MINUTES,
       lineItems: orderItemsPayload.map((i) => ({
         name: i.product_name,
         quantity: i.quantity,
@@ -127,6 +139,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ paymentUrl: payment.paymentUrl, invoiceNumber });
   } catch (err) {
     console.error("DOKU createPayment error:", err);
+    // Payment link gagal dibuat -> lepas lagi reservasi stoknya, jangan
+    // sampai stok "ke-hold" padahal orderan-nya gak akan pernah dibayar.
+    await supabaseAdmin.rpc("release_order_stock", { p_order_id: order.id });
     await supabaseAdmin.from("orders").update({ status: "cancelled" }).eq("id", order.id);
     return NextResponse.json(
       { error: "Gagal membuat link pembayaran. Coba lagi sebentar lagi." },

@@ -117,20 +117,60 @@ URL ngrok + `/api/doku/webhook`.
 6. Jalankan `npm run auth:migrate` sekali dari lokal (dengan `DATABASE_URL`
    production) untuk membuat tabel auth di database production.
 
-## Catatan penting
+## Update database yang sudah pernah di-deploy
+
+Kalau sebelumnya kamu sudah pernah menjalankan `supabase/schema.sql`
+versi lama (sebelum ada sistem reservasi stok), jalankan file
+**`supabase/migration_reserve_stock.sql`** di SQL Editor Supabase sekali
+saja. Aman dijalankan berkali-kali, dan tidak menghapus data yang sudah ada.
+
+## Cara kerja anti-tabrakan stok
+
+Sebelumnya stok baru dijatah pas pembayaran sukses — itu artinya kalau
+stok tinggal 1 dan 2 orang checkout produk yang sama nyaris bersamaan,
+keduanya bisa lanjut bayar, padahal yang bisa dapat barang cuma 1.
+
+Sekarang alurnya:
+
+1. **Checkout dibuat** → stok langsung **direservasi** (status
+   `reserved`) SEBELUM diarahkan ke halaman bayar DOKU. Begitu
+   direservasi, item itu langsung hilang dari hitungan "stok tersedia"
+   buat pembeli lain.
+2. Kalau stok gak cukup buat direservasi (kalah cepat sama pembeli
+   lain), checkout langsung ditolak dengan pesan jelas — **sebelum**
+   sempat bayar, bukan sesudahnya.
+3. Reservasi berlaku 60 menit (sama dengan batas waktu bayar DOKU).
+   Kalau gak jadi dibayar, reservasi otomatis lepas balik ke tersedia
+   begitu ada pembeli lain coba checkout produk yang sama (self-healing,
+   gak butuh cron). Ada juga cron opsional (`vercel.json` +
+   `/api/cron/expire-orders`) yang aktif melepas reservasi basi setiap
+   15 menit + menandai order jadi `expired`, biar stok gak nyangkut
+   lama walau gak ada pembeli lain yang trigger.
+4. Pas pembayaran sukses (lewat webhook ATAU tombol "Tandai Lunas
+   Manual"), reservasi itu **difinalisasi** jadi `sold` — bukan ambil
+   stok baru — jadi pembeli pasti dapat barang yang sama persis yang
+   sempat "dikunci" buat dia dari awal.
+
+## Tombol "Tandai Lunas Manual"
+
+Ada di `/admin/orders`, buat kasus pembeli sudah bayar tapi webhook DOKU
+gagal/belum sempat diproses (mis. Notification URL belum diset dengan
+benar). **Selalu cek dulu status transaksinya di dashboard DOKU**
+sebelum klik tombol ini — jangan cuma percaya omongan pembeli. Tombol
+ini pakai fungsi database yang sama dengan webhook, jadi tetap aman
+dari tabrakan stok dan otomatis kirim email invoice + kredensial.
+
+## Catatan penting lainnya
 
 - Semua akses ke tabel Supabase (produk/stok/pesanan) lewat
   **service role key di server** — tidak pernah lewat browser. Jangan
   taruh `SUPABASE_SERVICE_ROLE_KEY` di kode client atau env
   `NEXT_PUBLIC_*`.
-- Penjatahan stok saat pembayaran sukses pakai fungsi Postgres
-  `assign_stock` dengan `FOR UPDATE SKIP LOCKED`, jadi aman walau ada
-  beberapa pembayaran masuk bersamaan — tidak akan ada 1 akun terjual
-  ke 2 pembeli.
-- Kalau stok ternyata habis pas notifikasi masuk (race sangat jarang),
-  order tidak otomatis ditandai "paid" — cek log server & tambah stok
-  manual, lalu proses ulang manual (fitur retry otomatis belum ada,
-  bisa ditambah kalau perlu).
 - Webhook DOKU mengabaikan status `FAILED` sesuai rekomendasi resmi
   DOKU Checkout (customer masih bisa ganti metode bayar di halaman
   checkout mereka).
+- Vercel Cron di paket gratis (Hobby) punya batasan frekuensi yang
+  bisa berubah sewaktu-waktu — cek dokumentasi Vercel terbaru kalau
+  cron di atas ternyata tidak jalan sesuai jadwal. Sistem tetap aman
+  tanpa cron ini karena reservasi basi otomatis lepas sendiri (lihat
+  penjelasan di atas), cron cuma mempercepat pelepasannya.
